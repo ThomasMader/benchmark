@@ -335,13 +335,13 @@ public:
                             "-release",
                             "-inline",
                             "-noboundscheck" ] ),
-            /* new Compiler( "ldc0.12.0", */
-            /*               "d", */
-            /*               [ "ldmd2", */
-            /*                 "-O", */
-            /*                 "-release", */
-            /*                 "-inline", */
-            /*                 "-noboundscheck" ] ), */
+            new Compiler( "ldc0.13.0",
+                          "d",
+                          [ "ldmd2",
+                            "-O",
+                            "-release",
+                            "-inline",
+                            "-noboundscheck" ] ),
             new Compiler( "gdc4.8.2",
                           "d",
                           [ "gdmd",
