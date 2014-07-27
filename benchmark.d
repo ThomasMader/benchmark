@@ -2,7 +2,11 @@
 
 import std.c.process;
 
+import core.stdc.config;
+import core.sys.posix.unistd;
+
 import std.stdio;
+import std.conv;
 import std.datetime;
 import std.file;
 import std.path;
@@ -131,6 +135,115 @@ public:
         return false;
     }
 
+    private string[][] readProcTable( string procPath )
+    {
+        string[] procPerLine = split( readText( procPath ), "\n" );
+        string[][] procTable;
+        foreach( line; procPerLine )
+        {
+            procTable ~= split( line, regex( `\s+` ) );
+        }
+        return procTable;
+    }
+
+    private T getProcTableEntry( T )( string[][] procTable,
+                                      int lineIdx,
+                                      int columnIdx )
+    {
+        return to!T( procTable[ lineIdx ][ columnIdx ] );
+    }
+
+    struct Cpu
+    {
+    public:
+        this( ulong idle, ulong total )
+        {
+            m_idle = idle;
+            m_total = total;
+        }
+
+        @property ulong idle()
+        {
+            return m_idle;
+        }
+
+        @property ulong total()
+        {
+            return m_total;
+        }
+
+    private:
+        ulong m_idle;
+        ulong m_total;
+    }
+
+    private Cpu[] cpuTimesPerCore()
+    {
+        string[][] statTable = readProcTable( "/proc/stat" );
+        // Support for Linux 2.6.0 and above
+        assert( statTable[ 0 ].length >= 8 &&
+                statTable[ 0 ][ 0 ].startsWith( "cpu" ) );
+        ulong[] getProcCPUColumn( const int column )
+        {
+            ulong[] values;
+            for( int i = 1;
+                 statTable[ i ][ 0 ].startsWith( "cpu" );
+                 i++ )
+            {
+                values ~= getProcTableEntry!( ulong )( statTable, i, column );
+            }
+            return values;
+        }
+
+        ulong[] userPerCPU = getProcCPUColumn( 1 );
+        ulong[] nicePerCPU = getProcCPUColumn( 2 );
+        ulong[] systemPerCPU = getProcCPUColumn( 3 );
+        ulong[] idlePerCPU = getProcCPUColumn( 4 );
+        ulong[] iowaitPerCPU = getProcCPUColumn( 5 );
+        ulong[] irqPerCPU = getProcCPUColumn( 6 );
+        ulong[] softirqPerCPU = getProcCPUColumn( 7 );
+        Cpu[] cpus;
+        foreach( i, user; userPerCPU )
+        {
+            ulong totalPerCPU = user +
+                                nicePerCPU[ i ] +
+                                systemPerCPU[ i ] +
+                                idlePerCPU[ i ] +
+                                iowaitPerCPU[ i ] +
+                                irqPerCPU[ i ] +
+                                softirqPerCPU[ i ];
+            cpus ~= [ Cpu( idlePerCPU[ i ], totalPerCPU ) ];
+        }
+        return cpus;
+    }
+
+    private string cpuLoadPerCore( Cpu[] cpu0, Cpu[] cpu1 )
+    {
+        string cpuLoadPerCore;
+        for( int i = 0; i < cpu0.length; i++ )
+        {
+            float idleDelta = cpu1[ i ].idle - cpu0[ i ].idle;
+            ulong totalDelta = cpu1[ i ].total - cpu0[ i ].total;
+            int cpuLoad = roundTo!int( 100 * ( 1.0 - idleDelta / totalDelta ) );
+            cpuLoadPerCore ~= to!string( cpuLoad ) ~ "% ";
+        }
+        return cpuLoadPerCore;
+    }
+
+    private auto measure( ref StopWatch sw, string cmd )
+    {
+        Cpu[] cpu0 = cpuTimesPerCore();
+        string procUptime = "/proc/uptime";
+        string procStat = "/proc/" ~ to!string( thisProcessID() ) ~ "/stat";
+        sw.start();
+        auto result = executeShell( cmd );
+        sw.stop();
+        Cpu[] cpu1 = cpuTimesPerCore();
+        /* c_long hertz = sysconf( _SC_CLK_TCK ); */
+        writeln( cpuLoadPerCore( cpu0, cpu1 ) );
+        return result;
+    }
+
     private void compile( Compiler compiler,
                           string extension,
                           string srcFile,
@@ -153,10 +266,9 @@ public:
                      compiler.id,
                      " Compilation]\n",
                      join( cmd, " " ) );
+            string cmdString = join( cmd, " " );
             StopWatch sw;
-            sw.start();
-            auto result = execute( cmd );
-            sw.stop();
+            auto result = measure( sw, cmdString );
             if( result.status !=  0 )
             {
                 stderr.writeln( "Compilation failed:\n", result.output );
@@ -245,9 +357,7 @@ public:
                              " Execution]\n",
                              command );
                     StopWatch sw;
-                    sw.start();
-                    auto result = executeShell( command );
-                    sw.stop();
+                    auto result = measure( sw, command );
                     if( result.status !=  0 )
                     {
                         stderr.writeln( "Execution failed:\n", result.output );
