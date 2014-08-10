@@ -2,6 +2,7 @@
 
 import std.c.process;
 
+import core.thread;
 import core.stdc.config;
 import core.sys.posix.unistd;
 
@@ -14,6 +15,7 @@ import std.array;
 import std.algorithm;
 import std.regex;
 import std.string;
+import std.parallelism;
 import std.process;
 
 
@@ -230,18 +232,92 @@ public:
         return cpuLoadPerCore;
     }
 
-    private auto measure( ref StopWatch sw, string cmd )
+    private ulong maxMemoryForProcess( Pid p_pid )
+    {
+        string[][] statusTable = readProcTable( "/proc/1/status" );
+        assert( statusTable[ 5 ][ 0 ].startsWith( "PPid" ) &&
+                statusTable[ 5 ].length == 2 &&
+                statusTable[ 4 ][ 0 ].startsWith( "Pid" ) &&
+                statusTable[ 4 ].length == 2 &&
+                statusTable[ 15 ][ 0 ].startsWith( "VmHWM" ) &&
+                statusTable[ 15 ].length == 3 &&
+                statusTable[ 15 ][ 2 ] == "kB" );
+        ulong memory = 0;
+        foreach( string name; dirEntries( "/proc", SpanMode.shallow ) )
+        {
+            if( name.isDir && baseName( name ).isNumeric )
+            {
+                statusTable = readProcTable( name ~ "/status" );
+                ulong ppid = getProcTableEntry!( ulong )( statusTable, 5, 1 );
+                ulong pid = getProcTableEntry!( ulong )( statusTable, 4, 1 );
+                if( pid == p_pid.processID || ppid == p_pid.processID )
+                {
+                    memory += getProcTableEntry!( ulong )( statusTable, 15, 1 );
+                }
+            }
+        }
+        return memory;
+    }
+
+    private ulong measureMemory( Pid pid )
+    {
+        auto child = tryWait( pid );
+        ulong maxMemory;
+        while( !child.terminated )
+        {
+            maxMemory = max( maxMemoryForProcess( pid ), maxMemory );
+            core.thread.Thread.sleep( dur!( "msecs" )( 200 ) );
+            child = tryWait( pid );
+        }
+        return maxMemory;
+    }
+
+    private void measure( string[] cmd,
+                          string compilerOutputFile = "",
+                          string benchmarkOutputFile = "" )
     {
         Cpu[] cpu0 = cpuTimesPerCore();
         string procUptime = "/proc/uptime";
         string procStat = "/proc/" ~ to!string( thisProcessID() ) ~ "/stat";
+        StopWatch sw;
         sw.start();
-        auto result = executeShell( cmd );
+        auto pipes = pipeProcess( cmd, Redirect.stdout | Redirect.stderr );
+        auto memoryTask = task( &measureMemory, pipes.pid );
+        memoryTask.executeInNewThread();
+        int status = wait( pipes.pid );
         sw.stop();
-        Cpu[] cpu1 = cpuTimesPerCore();
-        /* c_long hertz = sysconf( _SC_CLK_TCK ); */
-        writeln( cpuLoadPerCore( cpu0, cpu1 ) );
-        return result;
+        if( status == 0 )
+        {
+            Cpu[] cpu1 = cpuTimesPerCore();
+            /* c_long hertz = sysconf( _SC_CLK_TCK ); */
+            writeln( "Memory: " ~ to!string( memoryTask.yieldForce ) ~ "[kB]" );
+            writeln( "~ CPU Load: " ~ cpuLoadPerCore( cpu0, cpu1 ) );
+            writeln( "Execution time: ",
+                     sw.peek().msecs,
+                     "[ms]\n" );
+            if( !compilerOutputFile.empty && !benchmarkOutputFile.empty )
+            {
+                string output;
+                foreach( line; pipes.stdout.byLine )
+                {
+                    output ~= line.idup ~ "\n";
+                }
+                std.file.write( compilerOutputFile, output );
+                if( !benchmarkOutputFile.exists )
+                {
+                    copy( compilerOutputFile, benchmarkOutputFile );
+                }
+            }
+        }
+        else
+        {
+            foreach( line; pipes.stderr.byLine )
+            {
+                stderr.writeln( line.idup );
+            }
+            stderr.writeln( "Spawned process failed.\n" );
+            exit( 1 );
+        }
     }
 
     private void compile( Compiler compiler,
@@ -266,18 +342,7 @@ public:
                      compiler.id,
                      " Compilation]\n",
                      join( cmd, " " ) );
-            string cmdString = join( cmd, " " );
-            StopWatch sw;
-            auto result = measure( sw, cmdString );
-            if( result.status !=  0 )
-            {
-                stderr.writeln( "Compilation failed:\n", result.output );
-                exit( 1 );
-            }
-            else
-            {
-                writeln( "Compilation time: ", sw.peek().msecs, "[ms]\n" );
-            }
+            measure( cmd );
         }
     }
 
@@ -328,9 +393,8 @@ public:
                 if( ( dependentBenchmark && !benchmarkOutputFile.exists ) ||
                     dependentBenchmark is null )
                 {
-                    string compilerOutputfile = buildPath( compilerOutputDir,
+                    string compilerOutputFile = buildPath( compilerOutputDir,
                                                            outputFileName );
-                    string command;
                     if( dependency )
                     {
                         string depInputFile = buildPath( benchmarkOutputDir,
@@ -338,7 +402,7 @@ public:
                                                          "_" ~
                                                          argument ~
                                                          ".txt" );
-                        command = join( runCommand ~ "<" ~ depInputFile, " " );
+                        runCommand ~= "<" ~ depInputFile;
                         if( !depInputFile.exists )
                         {
                             dependency.compile( this );
@@ -347,7 +411,7 @@ public:
                     }
                     else
                     {
-                        command = join( runCommand ~ argument, " " );
+                        runCommand ~= argument;
                     }
                     chdir( compilerBuildDir );
                     writeln( "[",
@@ -355,25 +419,10 @@ public:
                              " ",
                              compiler.id,
                              " Execution]\n",
-                             command );
-                    StopWatch sw;
-                    auto result = measure( sw, command );
-                    if( result.status !=  0 )
-                    {
-                        stderr.writeln( "Execution failed:\n", result.output );
-                        exit( 1 );
-                    }
-                    else
-                    {
-                        writeln( "Execution time: ",
-                                 sw.peek().msecs,
-                                 "[ms]\n" );
-                        std.file.write( compilerOutputfile, result.output );
-                        if( !benchmarkOutputFile.exists )
-                        {
-                            copy( compilerOutputfile, benchmarkOutputFile );
-                        }
-                    }
+                             join( runCommand, " " ) );
+                    measure( runCommand,
+                             compilerOutputFile,
+                             benchmarkOutputFile );
                 }
             }
         }
