@@ -232,62 +232,79 @@ public:
         return cpuLoadPerCore;
     }
 
-    private ulong maxMemoryForProcess( Pid p_pid )
+    private ulong measureMemory( Pid p_pid )
     {
-        string[][] statusTable = readProcTable( "/proc/1/status" );
-        assert( statusTable[ 5 ][ 0 ].startsWith( "PPid" ) &&
-                statusTable[ 5 ].length == 2 &&
-                statusTable[ 4 ][ 0 ].startsWith( "Pid" ) &&
-                statusTable[ 4 ].length == 2 &&
-                statusTable[ 15 ][ 0 ].startsWith( "VmHWM" ) &&
-                statusTable[ 15 ].length == 3 &&
-                statusTable[ 15 ][ 2 ] == "kB" );
-        ulong memory = 0;
-        foreach( string name; dirEntries( "/proc", SpanMode.shallow ) )
+        ulong maxMemory = 0;
+        immutable pid = to!string( p_pid.processID );
+        while( !tryWait( p_pid ).terminated )
         {
-            if( name.isDir && baseName( name ).isNumeric )
+            StopWatch sw;
+            sw.start();
+            auto ps = executeShell( "ps h --ppid " ~ pid ~ " --pid " ~ pid ~
+                                    " -o rss" );
+            if( ps.status == 0 )
             {
-                statusTable = readProcTable( name ~ "/status" );
-                ulong ppid = getProcTableEntry!( ulong )( statusTable, 5, 1 );
-                ulong pid = getProcTableEntry!( ulong )( statusTable, 4, 1 );
-                if( pid == p_pid.processID || ppid == p_pid.processID )
+                long memory = 0;
+                foreach( string line; split( ps.output, "\n" ) )
                 {
-                    memory += getProcTableEntry!( ulong )( statusTable, 15, 1 );
+                    line = line.strip;
+                    if( line.isNumeric )
+                    {
+                        memory += to!int( line );
+                    }
                 }
+                maxMemory = max( memory, maxMemory );
             }
-        }
-        return memory;
-    }
-
-    private ulong measureMemory( Pid pid )
-    {
-        auto child = tryWait( pid );
-        ulong maxMemory;
-        while( !child.terminated )
-        {
-            maxMemory = max( maxMemoryForProcess( pid ), maxMemory );
-            core.thread.Thread.sleep( dur!( "msecs" )( 200 ) );
-            child = tryWait( pid );
+            sw.stop();
+            long sleepTime = 200 - sw.peek().msecs();
+            if( sleepTime > 0 )
+            {
+                core.thread.Thread.sleep( dur!( "msecs" )( sleepTime ) );
+            }
         }
         return maxMemory;
     }
 
     private void measure( string[] cmd,
+                          string depInputFile = "",
                           string compilerOutputFile = "",
                           string benchmarkOutputFile = "" )
     {
         Cpu[] cpu0 = cpuTimesPerCore();
-        string procUptime = "/proc/uptime";
-        string procStat = "/proc/" ~ to!string( thisProcessID() ) ~ "/stat";
         StopWatch sw;
         sw.start();
-        auto pipes = pipeProcess( cmd, Redirect.stdout | Redirect.stderr );
-        auto memoryTask = task( &measureMemory, pipes.pid );
+        auto processIn = stdin;
+        auto processOut = stdout;
+        if( !depInputFile.empty )
+        {
+            processIn = File( depInputFile, "r" );
+        }
+        if( !compilerOutputFile.empty )
+        {
+            processOut = File( compilerOutputFile, "w" );
+        }
+        scope( exit )
+        {
+            if( !depInputFile.empty )
+            {
+                processIn.close();
+            }
+            if( !compilerOutputFile.empty )
+            {
+                processOut.close();
+            }
+        }
+        Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
+        auto memoryTask = task( &measureMemory, pid );
         memoryTask.executeInNewThread();
-        int status = wait( pipes.pid );
+        int status = wait( pid );
         sw.stop();
         if( status == 0 )
         {
+            if( !compilerOutputFile.empty && !benchmarkOutputFile.exists )
+            {
+                copy( compilerOutputFile, benchmarkOutputFile );
+            }
             Cpu[] cpu1 = cpuTimesPerCore();
             /* c_long hertz = sysconf( _SC_CLK_TCK ); */
             writeln( "Memory: " ~ to!string( memoryTask.yieldForce ) ~ "[kB]" );
@@ -295,26 +312,9 @@ public:
             writeln( "Execution time: ",
                      sw.peek().msecs,
                      "[ms]\n" );
-            if( !compilerOutputFile.empty && !benchmarkOutputFile.empty )
-            {
-                string output;
-                foreach( line; pipes.stdout.byLine )
-                {
-                    output ~= line.idup ~ "\n";
-                }
-                std.file.write( compilerOutputFile, output );
-                if( !benchmarkOutputFile.exists )
-                {
-                    copy( compilerOutputFile, benchmarkOutputFile );
-                }
-            }
         }
         else
         {
-            foreach( line; pipes.stderr.byLine )
-            {
-                stderr.writeln( line.idup );
-            }
             stderr.writeln( "Spawned process failed.\n" );
             exit( 1 );
         }
@@ -336,11 +336,11 @@ public:
                 element = element.replace( "$compilerBuildDir", compilerBuildDir );
             }
             chdir( compilerBuildDir );
-            writeln( "[",
+            writeln( "[Compile ",
                      id,
                      " ",
                      compiler.id,
-                     " Compilation]\n",
+                     "]\n",
                      join( cmd, " " ) );
             measure( cmd );
         }
@@ -395,14 +395,15 @@ public:
                 {
                     string compilerOutputFile = buildPath( compilerOutputDir,
                                                            outputFileName );
+                    string depInputFile;
                     if( dependency )
                     {
-                        string depInputFile = buildPath( benchmarkOutputDir,
+                        depInputFile = buildPath( benchmarkOutputDir,
                                                          dependency.id ~
                                                          "_" ~
                                                          argument ~
                                                          ".txt" );
-                        runCommand ~= "<" ~ depInputFile;
+                        /* runCommand ~= "<" ~ depInputFile; */
                         if( !depInputFile.exists )
                         {
                             dependency.compile( this );
@@ -414,13 +415,19 @@ public:
                         runCommand ~= argument;
                     }
                     chdir( compilerBuildDir );
-                    writeln( "[",
-                             id,
-                             " ",
-                             compiler.id,
-                             " Execution]\n",
-                             join( runCommand, " " ) );
+                    write( "[Execute ",
+                           id,
+                           " ",
+                           compiler.id,
+                           "]\n",
+                           join( runCommand, " " ) );
+                    if( dependency )
+                    {
+                        write( " < " ~ depInputFile );
+                    }
+                    writeln();
                     measure( runCommand,
+                             depInputFile,
                              compilerOutputFile,
                              benchmarkOutputFile );
                 }
