@@ -2,10 +2,6 @@
 
 import std.c.process;
 
-import core.thread;
-import core.stdc.config;
-import core.sys.posix.unistd;
-
 import std.stdio;
 import std.conv;
 import std.datetime;
@@ -232,11 +228,51 @@ public:
         return cpuLoadPerCore;
     }
 
-    private ulong measureMemory( Pid p_pid )
+    private bool tryWait( int p_pid )
+    {
+        import core.stdc.errno;
+        import core.sys.posix.sys.wait;
+        while(true)
+        {
+            int status;
+            auto check = waitpid(p_pid, &status, WNOHANG);
+            if (check == -1)
+            {
+                if (errno == ECHILD)
+                {
+                    throw new ProcessException(
+                        "Process does not exist or is not a child process.");
+                }
+                else
+                {
+                    // waitpid() was interrupted by a signal.  We simply
+                    // restart it.
+                    assert (errno == EINTR);
+                    continue;
+                }
+            }
+            if (check == 0)
+            {
+                break;
+            }
+            if (WIFEXITED(status))
+            {
+                return true;
+            }
+            else if (WIFSIGNALED(status))
+            {
+                return true;
+            }
+            break;
+        }
+        return false;
+    }
+
+    private ulong measureMemory( int p_pid )
     {
         ulong maxMemory = 0;
-        immutable pid = to!string( p_pid.processID );
-        while( !tryWait( p_pid ).terminated )
+        immutable pid = to!string( p_pid );
+        while( !tryWait( p_pid ) )
         {
             StopWatch sw;
             sw.start();
@@ -270,53 +306,74 @@ public:
                           string compilerOutputFile = "",
                           string benchmarkOutputFile = "" )
     {
-        Cpu[] cpu0 = cpuTimesPerCore();
-        StopWatch sw;
-        sw.start();
-        auto processIn = stdin;
-        auto processOut = stdout;
-        if( !depInputFile.empty )
+        import core.sys.posix.unistd;
+        import core.sys.posix.sys.resource;
+        int measureChildPid = fork();
+        if( measureChildPid == 0 )
         {
-            processIn = File( depInputFile, "r" );
-        }
-        if( !compilerOutputFile.empty )
-        {
-            processOut = File( compilerOutputFile, "w" );
-        }
-        scope( exit )
-        {
+            auto processIn = stdin;
+            auto processOut = stdout;
             if( !depInputFile.empty )
             {
-                processIn.close();
+                processIn = File( depInputFile, "r" );
             }
             if( !compilerOutputFile.empty )
             {
-                processOut.close();
+                processOut = File( compilerOutputFile, "w" );
             }
-        }
-        Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
-        auto memoryTask = task( &measureMemory, pid );
-        memoryTask.executeInNewThread();
-        int status = wait( pid );
-        sw.stop();
-        if( status == 0 )
-        {
-            if( !compilerOutputFile.empty && !benchmarkOutputFile.exists )
+            scope( exit )
             {
-                copy( compilerOutputFile, benchmarkOutputFile );
+                if( !depInputFile.empty )
+                {
+                    processIn.close();
+                }
+                if( !compilerOutputFile.empty )
+                {
+                    processOut.close();
+                }
             }
+            Cpu[] cpu0 = cpuTimesPerCore();
+            StopWatch sw;
+            sw.start();
+            Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
+            int status = wait( pid );
+            sw.stop();
             Cpu[] cpu1 = cpuTimesPerCore();
-            /* c_long hertz = sysconf( _SC_CLK_TCK ); */
-            writeln( "Memory: " ~ to!string( memoryTask.yieldForce ) ~ "[kB]" );
-            writeln( "~ CPU Load: " ~ cpuLoadPerCore( cpu0, cpu1 ) );
-            writeln( "Execution time: ",
-                     sw.peek().msecs,
-                     "[ms]\n" );
+            if( status == 0 )
+            {
+                if( !compilerOutputFile.empty && !benchmarkOutputFile.exists )
+                {
+                    copy( compilerOutputFile, benchmarkOutputFile );
+                }
+                writeln( "~ CPU Load: " ~ cpuLoadPerCore( cpu0, cpu1 ) );
+                writefln( "Elapsed seconds: %.2f[s]",
+                          sw.peek().to!( "seconds", double )() );
+                rusage usage;
+                getrusage( RUSAGE_CHILDREN, &usage );
+                double utime = usage.ru_utime.tv_sec * 1000 +
+                             usage.ru_utime.tv_usec / 1000;
+                double stime = usage.ru_stime.tv_sec * 1000 +
+                             usage.ru_stime.tv_usec / 1000;
+                double cpuTime = utime + stime;
+                writefln( "CPU seconds: %.2f[s]", cpuTime / 1000 );
+            }
+            else
+            {
+                stderr.writeln( "Spawned process failed.\n" );
+                exit( 1 );
+            }
+            exit( 0 );
         }
-        else
+        else if( measureChildPid > 0 )
         {
-            stderr.writeln( "Spawned process failed.\n" );
-            exit( 1 );
+            long measuredMemory = measureMemory( measureChildPid );
+            int childExitCode = 0;
+            core.sys.posix.sys.wait.wait( &childExitCode );
+            if( childExitCode > 0 )
+            {
+                exit( childExitCode );
+            }
+            writeln( "Memory: " ~ to!string( measuredMemory ) ~ "[kB]\n" );
         }
     }
 
