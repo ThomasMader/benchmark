@@ -2,6 +2,8 @@
 
 import std.c.process;
 
+import core.sys.posix.signal: SIGKILL, SIGTERM;
+
 import std.stdio;
 import std.conv;
 import std.datetime;
@@ -356,6 +358,10 @@ public:
                 entries.value( "PPid" ).startsWith( "PPid" ) &&
                 entries.value( "VmHWM" ).startsWith( "VmHWM" ) &&
                 entries.value( "kB" ).startsWith( "kB" ) );
+        ulong termTimeout = 5 * 60;
+        ulong killTimeout = termTimeout + 30;
+        StopWatch timeoutWatch;
+        timeoutWatch.start();
         auto child = tryWait( pid );
         ulong maxMemory;
         while( !child.terminated )
@@ -364,7 +370,17 @@ public:
             sw.start();
             maxMemory = max( maxMemoryForProcess( pid ), maxMemory );
             sw.stop();
+            bool isTermTimeout = timeoutWatch.peek().seconds() >= termTimeout;
+            bool isKillTimeout = timeoutWatch.peek().seconds() >= killTimeout;
             long sleepTime = 200 - sw.peek().msecs();
+            if( isTermTimeout && !isKillTimeout )
+            {
+                kill( pid, SIGTERM );
+            }
+            if( isKillTimeout )
+            {
+                kill( pid, SIGKILL );
+            }
             if( sleepTime > 0 )
             {
                 core.thread.Thread.sleep( dur!( "msecs" )( sleepTime ) );
@@ -443,8 +459,19 @@ public:
         }
         else
         {
-            stderr.writeln( "Spawned process failed.\n" );
-            exit( 1 );
+            if( status == 143 )
+            {
+                stderr.writeln( "Spawned process timed out. (got terminated)\n" );
+            }
+            else if( status == -SIGKILL )
+            {
+                stderr.writeln( "Spawned process timed out. (got killed)\n" );
+            }
+            else
+            {
+                stderr.writeln( "Spawned process failed.\n" );
+                exit( 1 );
+            }
         }
     }
 
