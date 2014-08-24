@@ -161,15 +161,24 @@ public:
                   int, "lineIdx",
                   int, "columnIdx" ) ProcTableCell;
 
-    private T getProcTableEntry( T )( string procPath,
-                                         int lineIdx,
-                                         int columnIdx )
+    private T getProcTableEntry( T = string )( string procPath,
+                                               int lineIdx,
+                                               int columnIdx )
     {
         return getProcTableEntries( procPath,
                                     [ ProcTableCell( "",
                                                      lineIdx,
                                                      columnIdx )
                                     ] ).value!T( "" );
+    }
+
+    private ProcTableEntries getProcTableEntries( string procPath )
+    {
+        return getProcTableEntries( procPath,
+                                    [ ProcTableCell( "",
+                                                     -1,
+                                                     -1 )
+                                    ] );
     }
 
     private ProcTableEntries getProcTableEntries(
@@ -184,28 +193,34 @@ public:
         multiSort!( "a[1] < b[1]", "a[2] < b[2]" )( p_cells );
         auto currentCell = p_cells.front;
         p_cells.popFront;
+        bool allLines = currentCell.lineIdx < 0 ? true : false;
+        bool allColumns = currentCell.columnIdx < 0 ? true : false;
         foreach( ubyte[] c; File( procPath, "r" ).byChunk( 1 ) )
         {
-            if( i > currentCell.lineIdx ||
-                ( i >= currentCell.lineIdx && j > currentCell.columnIdx ) )
+            if( !allLines || !allColumns )
             {
-                if( !p_cells.empty )
+                if( ( i > currentCell.lineIdx && !allLines ) ||
+                    ( i >= currentCell.lineIdx &&
+                        ( j > currentCell.columnIdx && !allColumns ) ) )
                 {
-                    currentCell = p_cells.front;
-                    p_cells.popFront;
-                }
-                else
-                {
-                    break;
+                    if( !p_cells.empty )
+                    {
+                        currentCell = p_cells.front;
+                        p_cells.popFront;
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
             }
-            if( c == newline && currentCell.lineIdx != i )
+            if( c == newline )
             {
                 i++;
                 j = 0;
                 continue;
             }
-            if( currentCell.lineIdx == i )
+            if( currentCell.lineIdx == i || allLines )
             {
                 if( c[ 0 ].isWhite() )
                 {
@@ -217,31 +232,23 @@ public:
                     inWhite = false;
                     j++;
                 }
-                if( currentCell.columnIdx == j )
+                if( currentCell.columnIdx == j || allColumns )
                 {
-                    entries.appendToValue( currentCell.id, c[ 0 ] );
+                    if( allLines || allColumns )
+                    {
+                        entries.appendToValue( to!string( i ) ~
+                                               "," ~
+                                               to!string( j ),
+                                               c[ 0 ] );
+                    }
+                    else
+                    {
+                        entries.appendToValue( currentCell.id, c[ 0 ] );
+                    }
                 }
             }
         }
         return entries; 
-    }
-
-    private string[][] readProcTable( string procPath )
-    {
-        string[] procPerLine = split( readText( procPath ), "\n" );
-        string[][] procTable;
-        foreach( line; procPerLine )
-        {
-            procTable ~= split( line, regex( `\s+` ) );
-        }
-        return procTable;
-    }
-
-    private T getProcTableEntry( T )( string[][] procTable,
-                                      int lineIdx,
-                                      int columnIdx )
-    {
-        return to!T( procTable[ lineIdx ][ columnIdx ] );
     }
 
     struct Cpu
@@ -270,40 +277,24 @@ public:
 
     private Cpu[] cpuTimesPerCore()
     {
-        string[][] statTable = readProcTable( "/proc/stat" );
+        ProcTableEntries entries = getProcTableEntries( "/proc/stat" );
         // Support for Linux 2.6.0 and above
-        assert( statTable[ 0 ].length >= 8 &&
-                statTable[ 0 ][ 0 ].startsWith( "cpu" ) );
-        ulong[] getProcCPUColumn( const int column )
-        {
-            ulong[] values;
-            for( int i = 1;
-                 statTable[ i ][ 0 ].startsWith( "cpu" );
-                 i++ )
-            {
-                values ~= getProcTableEntry!( ulong )( statTable, i, column );
-            }
-            return values;
-        }
-
-        ulong[] userPerCPU = getProcCPUColumn( 1 );
-        ulong[] nicePerCPU = getProcCPUColumn( 2 );
-        ulong[] systemPerCPU = getProcCPUColumn( 3 );
-        ulong[] idlePerCPU = getProcCPUColumn( 4 );
-        ulong[] iowaitPerCPU = getProcCPUColumn( 5 );
-        ulong[] irqPerCPU = getProcCPUColumn( 6 );
-        ulong[] softirqPerCPU = getProcCPUColumn( 7 );
+        assert( entries.value( "0,0" ) == "cpu" &&
+                entries.value( "1,0" ) == "cpu0" );
         Cpu[] cpus;
-        foreach( i, user; userPerCPU )
+        string line;
+        for( int i = 1;
+             entries.value( ( line = to!string( i ) ) ~ ",0" ).startsWith( "cpu" );
+             i++ )
         {
-            ulong totalPerCPU = user +
-                                nicePerCPU[ i ] +
-                                systemPerCPU[ i ] +
-                                idlePerCPU[ i ] +
-                                iowaitPerCPU[ i ] +
-                                irqPerCPU[ i ] +
-                                softirqPerCPU[ i ];
-            cpus ~= [ Cpu( idlePerCPU[ i ], totalPerCPU ) ];
+            ulong totalPerCPU = 0;
+            foreach( int j; 1 .. 8 )
+            {
+                string column = to!string( j );
+                totalPerCPU += entries.value!ulong( line ~ "," ~ column );
+            }
+            ulong idle = entries.value!ulong( line ~ ",4" );
+            cpus ~= [ Cpu( idle, totalPerCPU ) ];
         }
         return cpus;
     }
