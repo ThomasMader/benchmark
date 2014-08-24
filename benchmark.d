@@ -11,6 +11,7 @@ import std.array;
 import std.algorithm;
 import std.regex;
 import std.string;
+import std.typecons;
 import std.parallelism;
 import std.process;
 
@@ -133,6 +134,96 @@ public:
         return false;
     }
 
+    struct ProcTableEntries
+    {
+        public:
+            void appendToValue( string p_id, char p_char )
+            {
+                valuesPerId[ p_id ] ~= p_char;
+            }
+
+            T value( T = string )( string p_id = valuesPerId.keys[ 0 ] )
+            {
+                static if( is( typeof( T ) == string ) )
+                {
+                    return valuesPerId[ p_id ];
+                }
+                return to!T( valuesPerId[ p_id ] );
+            }
+
+        private:
+            string[ string ] valuesPerId;
+    }
+
+    alias Tuple!( string, "id",
+                  int, "lineIdx",
+                  int, "columnIdx" ) ProcTableCell;
+
+    private T getProcTableEntry( T )( string procPath,
+                                         int lineIdx,
+                                         int columnIdx )
+    {
+        return getProcTableEntries( procPath,
+                                    [ ProcTableCell( "",
+                                                     lineIdx,
+                                                     columnIdx )
+                                    ] ).value!T( "" );
+    }
+
+    private ProcTableEntries getProcTableEntries(
+                                string procPath,
+                                ProcTableCell[] p_cells )
+    {
+        import std.ascii;
+        ProcTableEntries entries;
+        bool inWhite = false;
+        int i = 0;
+        int j = 0;
+        multiSort!( "a[1] < b[1]", "a[2] < b[2]" )( p_cells );
+        auto currentCell = p_cells.front;
+        p_cells.popFront;
+        foreach( ubyte[] c; File( procPath, "r" ).byChunk( 1 ) )
+        {
+            if( i > currentCell.lineIdx ||
+                ( i >= currentCell.lineIdx && j > currentCell.columnIdx ) )
+            {
+                if( !p_cells.empty )
+                {
+                    currentCell = p_cells.front;
+                    p_cells.popFront;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            if( c == newline && currentCell.lineIdx != i )
+            {
+                i++;
+                j = 0;
+                continue;
+            }
+            if( currentCell.lineIdx == i )
+            {
+                if( c[ 0 ].isWhite() )
+                {
+                    inWhite = true;
+                    continue;
+                }
+                if( inWhite )
+                {
+                    inWhite = false;
+                    j++;
+                }
+                if( currentCell.columnIdx == j )
+                {
+                    entries.appendToValue( currentCell.id, c[ 0 ] );
+                }
+            }
+        }
+        return entries; 
+    }
+
     private string[][] readProcTable( string procPath )
     {
         string[] procPerLine = split( readText( procPath ), "\n" );
@@ -228,77 +319,74 @@ public:
         return cpuLoadPerCore;
     }
 
-    private bool tryWait( int p_pid )
+    private ulong maxMemoryForProcess( Pid p_pid )
     {
-        import core.stdc.errno;
-        import core.sys.posix.sys.wait;
-        while(true)
+        ulong memory = 0;
+        auto entries = dirEntries( "/proc", SpanMode.shallow, false );
+        foreach( string name; entries )
         {
-            int status;
-            auto check = waitpid(p_pid, &status, WNOHANG);
-            if (check == -1)
+            immutable pidString = baseName( name );
+            if( name.exists && name.isDir && pidString.isNumeric )
             {
-                if (errno == ECHILD)
+                int pid = to!int( pidString );
+                string procPath = name ~ "/status";
+                int ppid = getProcTableEntry!int( procPath, 5, 1 );
+
+                if( pid == p_pid.processID || ppid == p_pid.processID )
                 {
-                    throw new ProcessException(
-                        "Process does not exist or is not a child process.");
-                }
-                else
-                {
-                    // waitpid() was interrupted by a signal.  We simply
-                    // restart it.
-                    assert (errno == EINTR);
-                    continue;
+                    memory += getProcTableEntry!ulong( procPath, 15, 1 );
                 }
             }
-            if (check == 0)
-            {
-                break;
-            }
-            if (WIFEXITED(status))
-            {
-                return true;
-            }
-            else if (WIFSIGNALED(status))
-            {
-                return true;
-            }
-            break;
         }
-        return false;
+        return memory;
     }
 
-    private ulong measureMemory( int p_pid )
+    private ulong measureMemory( Pid pid )
     {
-        ulong maxMemory = 0;
-        immutable pid = to!string( p_pid );
-        while( !tryWait( p_pid ) )
+        ProcTableCell[] tableCells =
+        [   
+            ProcTableCell( "Pid", 4, 0 ),
+            ProcTableCell( "PPid", 5, 0 ),
+            ProcTableCell( "VmHWM", 15, 0 ),
+            ProcTableCell( "kB", 15, 2 )
+        ];
+        ProcTableEntries entries = getProcTableEntries( "/proc/1/status",
+                                                        tableCells );
+        assert( entries.value( "Pid" ).startsWith( "Pid" ) &&
+                entries.value( "PPid" ).startsWith( "PPid" ) &&
+                entries.value( "VmHWM" ).startsWith( "VmHWM" ) &&
+                entries.value( "kB" ).startsWith( "kB" ) );
+        auto child = tryWait( pid );
+        ulong maxMemory;
+        while( !child.terminated )
         {
             StopWatch sw;
             sw.start();
-            auto ps = executeShell( "ps h --ppid " ~ pid ~ " --pid " ~ pid ~
-                                    " -o rss" );
-            if( ps.status == 0 )
-            {
-                long memory = 0;
-                foreach( string line; split( ps.output, "\n" ) )
-                {
-                    line = line.strip;
-                    if( line.isNumeric )
-                    {
-                        memory += to!int( line );
-                    }
-                }
-                maxMemory = max( memory, maxMemory );
-            }
+            maxMemory = max( maxMemoryForProcess( pid ), maxMemory );
             sw.stop();
             long sleepTime = 200 - sw.peek().msecs();
             if( sleepTime > 0 )
             {
                 core.thread.Thread.sleep( dur!( "msecs" )( sleepTime ) );
             }
+            child = tryWait( pid );
         }
         return maxMemory;
+    }
+
+    alias Tuple!( double, "utime", double, "stime" ) CpuTimes;
+
+    private CpuTimes getCpuTimes()
+    {
+        import core.sys.posix.unistd;
+        import core.sys.posix.sys.resource;
+        rusage usage;
+        getrusage( RUSAGE_CHILDREN, &usage );
+        double utime = usage.ru_utime.tv_sec * 1_000_000 +
+                     usage.ru_utime.tv_usec;
+        double stime = usage.ru_stime.tv_sec * 1_000_000 +
+                     usage.ru_stime.tv_usec;
+        return CpuTimes( utime, stime );
     }
 
     private void measure( string[] cmd,
@@ -306,74 +394,57 @@ public:
                           string compilerOutputFile = "",
                           string benchmarkOutputFile = "" )
     {
-        import core.sys.posix.unistd;
-        import core.sys.posix.sys.resource;
-        int measureChildPid = fork();
-        if( measureChildPid == 0 )
+        auto processIn = stdin;
+        auto processOut = stdout;
+        if( !depInputFile.empty )
         {
-            auto processIn = stdin;
-            auto processOut = stdout;
+            processIn = File( depInputFile, "r" );
+        }
+        if( !compilerOutputFile.empty )
+        {
+            processOut = File( compilerOutputFile, "w" );
+        }
+        scope( exit )
+        {
             if( !depInputFile.empty )
             {
-                processIn = File( depInputFile, "r" );
+                processIn.close();
             }
             if( !compilerOutputFile.empty )
             {
-                processOut = File( compilerOutputFile, "w" );
+                processOut.close();
             }
-            scope( exit )
-            {
-                if( !depInputFile.empty )
-                {
-                    processIn.close();
-                }
-                if( !compilerOutputFile.empty )
-                {
-                    processOut.close();
-                }
-            }
-            Cpu[] cpu0 = cpuTimesPerCore();
-            StopWatch sw;
-            sw.start();
-            Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
-            int status = wait( pid );
-            sw.stop();
-            Cpu[] cpu1 = cpuTimesPerCore();
-            if( status == 0 )
-            {
-                if( !compilerOutputFile.empty && !benchmarkOutputFile.exists )
-                {
-                    copy( compilerOutputFile, benchmarkOutputFile );
-                }
-                writeln( "~ CPU Load: " ~ cpuLoadPerCore( cpu0, cpu1 ) );
-                writefln( "Elapsed seconds: %.2f[s]",
-                          sw.peek().to!( "seconds", double )() );
-                rusage usage;
-                getrusage( RUSAGE_CHILDREN, &usage );
-                double utime = usage.ru_utime.tv_sec * 1000 +
-                             usage.ru_utime.tv_usec / 1000;
-                double stime = usage.ru_stime.tv_sec * 1000 +
-                             usage.ru_stime.tv_usec / 1000;
-                double cpuTime = utime + stime;
-                writefln( "CPU seconds: %.2f[s]", cpuTime / 1000 );
-            }
-            else
-            {
-                stderr.writeln( "Spawned process failed.\n" );
-                exit( 1 );
-            }
-            exit( 0 );
         }
-        else if( measureChildPid > 0 )
+        Cpu[] cpu0 = cpuTimesPerCore();
+        CpuTimes cpuTimes0 = getCpuTimes();
+        StopWatch sw;
+        sw.start();
+        Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
+        auto memoryTask = task( &measureMemory, pid );
+        memoryTask.executeInNewThread();
+        int status = wait( pid );
+        sw.stop();
+        CpuTimes cpuTimes1 = getCpuTimes();
+        CpuTimes cpuTimes = CpuTimes( cpuTimes1.utime - cpuTimes0.utime,
+                                      cpuTimes1.stime - cpuTimes0.stime );
+        Cpu[] cpu1 = cpuTimesPerCore();
+        if( status == 0 )
         {
-            long measuredMemory = measureMemory( measureChildPid );
-            int childExitCode = 0;
-            core.sys.posix.sys.wait.wait( &childExitCode );
-            if( childExitCode > 0 )
+            if( !compilerOutputFile.empty && !benchmarkOutputFile.exists )
             {
-                exit( childExitCode );
+                copy( compilerOutputFile, benchmarkOutputFile );
             }
-            writeln( "Memory: " ~ to!string( measuredMemory ) ~ "[kB]\n" );
+            writeln( "~ CPU Load: " ~ cpuLoadPerCore( cpu0, cpu1 ) );
+            writefln( "Elapsed seconds: %.2f[s]",
+                      sw.peek().to!( "seconds", double )() );
+            writefln( "CPU utime: %.2f[s]", cpuTimes.utime / 1_000_000 );
+            writefln( "CPU stime: %.2f[s]", cpuTimes.stime / 1_000_000 );
+            writeln( "Memory: " ~ to!string( memoryTask.yieldForce() ) ~ "[kB]\n" );
+        }
+        else
+        {
+            stderr.writeln( "Spawned process failed.\n" );
+            exit( 1 );
         }
     }
 
