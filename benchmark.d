@@ -22,6 +22,12 @@ public:
         m_id = id;
         m_extension = extension;
         m_command = command;
+        try {
+            execute( command[ 0 ] );
+            Config.registerCompiler( extension, this );
+        } catch( ProcessException e ) {
+            writeln( "disabled ", id, " because it is not available" );
+        }
     }
 
     @property string id()
@@ -676,37 +682,33 @@ struct Config
 public:
     static this()
     {
-        s_compilersPerExtension[ "d" ] = [ 
-            new Compiler( "dmd2.064",
-                          "d",
-                          [ "dmd",
-                            "-O",
-                            "-release",
-                            "-inline",
-                            "-noboundscheck" ] ),
-            new Compiler( "ldc0.13.0",
-                          "d",
-                          [ "ldmd2",
-                            "-O",
-                            "-release",
-                            "-inline",
-                            "-noboundscheck" ] ),
-            new Compiler( "gdc4.8.2",
-                          "d",
-                          [ "gdmd",
-                            "-O",
-                            "-release",
-                            "-inline",
-                            "-noboundscheck" ] )
-        ];
+        auto compiler = new Compiler( "dmd2.064",
+                                      "d",
+                                    [ "dmd",
+                                      "-O",
+                                      "-release",
+                                      "-inline",
+                                      "-noboundscheck" ] );
+        compiler = new Compiler( "ldc0.13.0",
+                                  "d",
+                                [ "ldmd2",
+                                  "-O",
+                                  "-release",
+                                  "-inline",
+                                  "-noboundscheck" ] );
+        compiler = new Compiler( "gdc4.8.2",
+                                  "d",
+                                [ "gdmd",
+                                  "-O",
+                                  "-release",
+                                  "-inline",
+                                  "-noboundscheck" ] );
 
-        s_compilersPerExtension[ "java" ] = [
-            new Compiler( "javac1.7.0_55",
-                          "java",
-                          [ "javac",
-                            "-d", 
-                            "$compilerBuildDir" ] )
-        ];
+        compiler = new Compiler( "javac1.7.0_55",
+                                  "java",
+                                [ "javac",
+                                  "-d", 
+                                  "$compilerBuildDir" ] );
 
         s_runCommandPerExtension[ "d" ] = [ "./$name" ];
 
@@ -843,6 +845,11 @@ public:
             }
         }
         return benchmarksOrderedByDependency;
+    }
+
+    static void registerCompiler( string extension, Compiler compiler )
+    {
+        s_compilersPerExtension[ extension ] ~= compiler;
     }
 
     static Compiler[] compilersPerExt( string extension )
