@@ -680,7 +680,7 @@ private:
 struct Config
 {
 public:
-    static this()
+    static void initializeConfig()
     {
         auto compiler = new Compiler( "dmd2.064",
                                       "d",
@@ -887,6 +887,7 @@ void rmdirRecurseIfExists( immutable string dir )
 
 void main( string[] args )
 {
+    Config.initializeConfig();
     Benchmark[] benchmarks = Config.initializeBenchmarks( args );
     rmdirRecurseIfExists( "./build" );
     rmdirRecurseIfExists( "./output" );
