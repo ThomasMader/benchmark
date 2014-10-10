@@ -1,8 +1,4 @@
-#!/usr/bin/env rdmd
-
 import std.c.process;
-
-import core.sys.posix.signal: SIGKILL, SIGTERM;
 
 import std.stdio;
 import std.conv;
@@ -275,28 +271,131 @@ public:
         ulong m_total;
     }
 
-    private Cpu[] cpuTimesPerCore()
+    alias Tuple!( double, "utime", double, "stime" ) CpuTimes;
+
+    version( linux )
     {
-        ProcTableEntries entries = getProcTableEntries( "/proc/stat" );
-        // Support for Linux 2.6.0 and above
-        assert( entries.value( "0,0" ) == "cpu" &&
-                entries.value( "1,0" ) == "cpu0" );
-        Cpu[] cpus;
-        string line;
-        for( int i = 1;
-             entries.value( ( line = to!string( i ) ) ~ ",0" ).startsWith( "cpu" );
-             i++ )
+        import core.sys.posix.signal: SIGKILL, SIGTERM;
+
+        private Cpu[] cpuTimesPerCore()
         {
-            ulong totalPerCPU = 0;
-            foreach( int j; 1 .. 8 )
+            ProcTableEntries entries = getProcTableEntries( "/proc/stat" );
+            // Support for Linux 2.6.0 and above
+            assert( entries.value( "0,0" ) == "cpu" &&
+                    entries.value( "1,0" ) == "cpu0" );
+            Cpu[] cpus;
+            string line;
+            for( int i = 1;
+                 entries.value( ( line = to!string( i ) ) ~ ",0" ).startsWith( "cpu" );
+                 i++ )
             {
-                string column = to!string( j );
-                totalPerCPU += entries.value!ulong( line ~ "," ~ column );
+                ulong totalPerCPU = 0;
+                foreach( int j; 1 .. 8 )
+                {
+                    string column = to!string( j );
+                    totalPerCPU += entries.value!ulong( line ~ "," ~ column );
+                }
+                ulong idle = entries.value!ulong( line ~ ",4" );
+                cpus ~= [ Cpu( idle, totalPerCPU ) ];
             }
-            ulong idle = entries.value!ulong( line ~ ",4" );
-            cpus ~= [ Cpu( idle, totalPerCPU ) ];
+            return cpus;
         }
-        return cpus;
+
+        private ulong measureMemory( Pid pid )
+        {
+            ProcTableCell[] tableCells =
+            [   
+                ProcTableCell( "Pid", 4, 0 ),
+                ProcTableCell( "PPid", 5, 0 ),
+                ProcTableCell( "VmHWM", 15, 0 ),
+                ProcTableCell( "kB", 15, 2 )
+            ];
+            ProcTableEntries entries = getProcTableEntries( "/proc/1/status",
+                                                            tableCells );
+            assert( entries.value( "Pid" ).startsWith( "Pid" ) &&
+                    entries.value( "PPid" ).startsWith( "PPid" ) &&
+                    entries.value( "VmHWM" ).startsWith( "VmHWM" ) &&
+                    entries.value( "kB" ).startsWith( "kB" ) );
+            ulong termTimeout = 5 * 60;
+            ulong killTimeout = termTimeout + 30;
+            StopWatch timeoutWatch;
+            timeoutWatch.start();
+            auto child = tryWait( pid );
+            ulong maxMemory;
+            while( !child.terminated )
+            {
+                StopWatch sw;
+                sw.start();
+                maxMemory = max( maxMemoryForProcess( pid ), maxMemory );
+                sw.stop();
+                bool isTermTimeout = timeoutWatch.peek().seconds() >= termTimeout;
+                bool isKillTimeout = timeoutWatch.peek().seconds() >= killTimeout;
+                long sleepTime = 200 - sw.peek().msecs();
+                if( isTermTimeout && !isKillTimeout )
+                {
+                    kill( pid, SIGTERM );
+                }
+                if( isKillTimeout )
+                {
+                    kill( pid, SIGKILL );
+                }
+                if( sleepTime > 0 )
+                {
+                    core.thread.Thread.sleep( dur!( "msecs" )( sleepTime ) );
+                }
+                child = tryWait( pid );
+            }
+            return maxMemory;
+        }
+
+        private CpuTimes getCpuTimes()
+        {
+            import core.sys.posix.unistd;
+            import core.sys.posix.sys.resource;
+            rusage usage;
+            getrusage( RUSAGE_CHILDREN, &usage );
+            double utime = usage.ru_utime.tv_sec * 1_000_000 +
+                         usage.ru_utime.tv_usec;
+            double stime = usage.ru_stime.tv_sec * 1_000_000 +
+                         usage.ru_stime.tv_usec;
+            return CpuTimes( utime, stime );
+        }
+
+        private int getKillTimeoutSignal()
+        {
+            return -SIGKILL;
+        }
+    }
+    else version( Windows )
+    {
+        private Cpu[] cpuTimesPerCore()
+        {
+            Cpu[] cpus;
+            return cpus;
+        }
+
+        private ulong measureMemory( Pid pid )
+        {
+            return 0;
+        }
+
+        private CpuTimes getCpuTimes()
+        {
+            return CpuTimes(  );
+        }
+
+        private int getKillTimeoutSignal()
+        {
+            return 0;
+        }
+    }
+    else version( OSX )
+    {
+        static assert( 0, "OSX not yet supported." );
+    }
+    else
+    {
+        static assert( 0, "Unsupported OS" );
     }
 
     private string cpuLoadPerCore( Cpu[] cpu0, Cpu[] cpu1 )
@@ -332,68 +431,6 @@ public:
             }
         }
         return memory;
-    }
-
-    private ulong measureMemory( Pid pid )
-    {
-        ProcTableCell[] tableCells =
-        [   
-            ProcTableCell( "Pid", 4, 0 ),
-            ProcTableCell( "PPid", 5, 0 ),
-            ProcTableCell( "VmHWM", 15, 0 ),
-            ProcTableCell( "kB", 15, 2 )
-        ];
-        ProcTableEntries entries = getProcTableEntries( "/proc/1/status",
-                                                        tableCells );
-        assert( entries.value( "Pid" ).startsWith( "Pid" ) &&
-                entries.value( "PPid" ).startsWith( "PPid" ) &&
-                entries.value( "VmHWM" ).startsWith( "VmHWM" ) &&
-                entries.value( "kB" ).startsWith( "kB" ) );
-        ulong termTimeout = 5 * 60;
-        ulong killTimeout = termTimeout + 30;
-        StopWatch timeoutWatch;
-        timeoutWatch.start();
-        auto child = tryWait( pid );
-        ulong maxMemory;
-        while( !child.terminated )
-        {
-            StopWatch sw;
-            sw.start();
-            maxMemory = max( maxMemoryForProcess( pid ), maxMemory );
-            sw.stop();
-            bool isTermTimeout = timeoutWatch.peek().seconds() >= termTimeout;
-            bool isKillTimeout = timeoutWatch.peek().seconds() >= killTimeout;
-            long sleepTime = 200 - sw.peek().msecs();
-            if( isTermTimeout && !isKillTimeout )
-            {
-                kill( pid, SIGTERM );
-            }
-            if( isKillTimeout )
-            {
-                kill( pid, SIGKILL );
-            }
-            if( sleepTime > 0 )
-            {
-                core.thread.Thread.sleep( dur!( "msecs" )( sleepTime ) );
-            }
-            child = tryWait( pid );
-        }
-        return maxMemory;
-    }
-
-    alias Tuple!( double, "utime", double, "stime" ) CpuTimes;
-
-    private CpuTimes getCpuTimes()
-    {
-        import core.sys.posix.unistd;
-        import core.sys.posix.sys.resource;
-        rusage usage;
-        getrusage( RUSAGE_CHILDREN, &usage );
-        double utime = usage.ru_utime.tv_sec * 1_000_000 +
-                     usage.ru_utime.tv_usec;
-        double stime = usage.ru_stime.tv_sec * 1_000_000 +
-                     usage.ru_stime.tv_usec;
-        return CpuTimes( utime, stime );
     }
 
     private void measure( string[] cmd,
@@ -454,7 +491,7 @@ public:
             {
                 stderr.writeln( "Spawned process timed out. (got terminated)\n" );
             }
-            else if( status == -SIGKILL )
+            else if( status == getKillTimeoutSignal() )
             {
                 stderr.writeln( "Spawned process timed out. (got killed)\n" );
             }
