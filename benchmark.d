@@ -13,7 +13,6 @@ import std.typecons;
 import std.parallelism;
 import std.process;
 
-
 class Compiler
 {
 public:
@@ -374,6 +373,11 @@ public:
     }
     else version( Windows )
     {
+        import win32.windef;
+        import win32.winnt;
+        import win32.winbase;
+
+
         private Cpu[] cpuTimesPerCore()
         {
             Cpu[] cpus;
@@ -385,9 +389,17 @@ public:
             return 0;
         }
 
-        private CpuTimes getCpuTimes()
+        private double getCpuTimes( HANDLE p_jobHandle )
         {
-            return CpuTimes(  );
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION BasicInfo;
+            QueryInformationJobObject( p_jobHandle,
+                                       JOBOBJECTINFOCLASS.JobObjectBasicAccountingInformation,
+                                       &BasicInfo,
+                                       JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.sizeof,
+                                       NULL);
+            double userTime = cast( double )BasicInfo.TotalUserTime.QuadPart / 10_000_000;
+            double kernelTime = cast( double )BasicInfo.TotalKernelTime.QuadPart / 10_000_000;
+            return userTime + kernelTime;
         }
 
         private int getKillTimeoutSignal()
@@ -465,19 +477,41 @@ public:
                 processOut.close();
             }
         }
-        Cpu[] cpu0 = cpuTimesPerCore();
-        CpuTimes cpuTimes0 = getCpuTimes();
-        StopWatch sw;
-        sw.start();
-        Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
-        auto memoryTask = task( &measureMemory, pid );
-        memoryTask.executeInNewThread();
-        int status = wait( pid );
-        sw.stop();
-        CpuTimes cpuTimes1 = getCpuTimes();
-        CpuTimes cpuTimes = CpuTimes( cpuTimes1.utime - cpuTimes0.utime,
-                                      cpuTimes1.stime - cpuTimes0.stime );
-        Cpu[] cpu1 = cpuTimesPerCore();
+        version( linux )
+        {
+            Cpu[] cpu0 = cpuTimesPerCore();
+            CpuTimes cpuTimes0 = getCpuTimes();
+            StopWatch sw;
+            sw.start();
+            Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
+            auto memoryTask = task( &measureMemory, pid );
+            memoryTask.executeInNewThread();
+            int status = wait( pid );
+            sw.stop();
+            CpuTimes cpuTimes1 = getCpuTimes();
+            CpuTimes cpuTimes = CpuTimes( cpuTimes1.utime - cpuTimes0.utime,
+                                          cpuTimes1.stime - cpuTimes0.stime );
+            double cpuSecs = ( ( cpuTimes1.utime - cpuTimes0.utime ) +
+                               ( cpuTimes1.stime - cpuTimes0.stime ) ) /
+                                1_000_000;
+            Cpu[] cpu1 = cpuTimesPerCore();
+        }
+        else version( Windows )
+        {
+            Cpu[] cpu0 = cpuTimesPerCore();
+            StopWatch sw;
+            sw.start();
+            Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
+            HANDLE jobHandle = CreateJobObject( NULL, NULL );
+            AssignProcessToJobObject( jobHandle, pid.osHandle() );
+            auto memoryTask = task( &measureMemory, pid );
+            memoryTask.executeInNewThread();
+            int status = wait( pid );
+            sw.stop();
+            double cpuSecs = getCpuTimes( jobHandle );
+            CloseHandle( jobHandle );
+            Cpu[] cpu1 = cpuTimesPerCore();
+        }
         if( status == 0 )
         {
             if( !compilerOutputFile.empty && !benchmarkOutputFile.exists )
@@ -487,8 +521,7 @@ public:
             writeln( "~ CPU Load: " ~ cpuLoadPerCore( cpu0, cpu1 ) );
             writefln( "Elapsed seconds: %.2f[s]",
                       sw.peek().to!( "seconds", double )() );
-            writefln( "CPU utime: %.2f[s]", cpuTimes.utime / 1_000_000 );
-            writefln( "CPU stime: %.2f[s]", cpuTimes.stime / 1_000_000 );
+            writefln( "CPU seconds: %.2f[s]", cpuSecs );
             writeln( "Memory: " ~ to!string( memoryTask.yieldForce() ) ~ "[kB]\n" );
         }
         else
