@@ -53,7 +53,7 @@ private:
 class Benchmark
 {
 public:
-    static this() {
+    shared static this() {
         s_workingDir = getcwd();
     }
 
@@ -173,7 +173,7 @@ public:
                                     ] ).value!T( "" );
     }
 
-    private ProcTableEntries getProcTableEntries( string procPath )
+    private static ProcTableEntries getProcTableEntries( string procPath )
     {
         return getProcTableEntries( procPath,
                                     [ ProcTableCell( "",
@@ -182,7 +182,7 @@ public:
                                     ] );
     }
 
-    private ProcTableEntries getProcTableEntries(
+    private static ProcTableEntries getProcTableEntries(
                                 string procPath,
                                 ProcTableCell[] p_cells )
     {
@@ -277,17 +277,46 @@ public:
     }
 
     alias Tuple!( double, "utime", double, "stime" ) CpuTimes;
+    alias Tuple!( int, "status",
+                  int[], "cpuLoad",
+                  double, "elapsedSecs",
+                  double, "cpuSecs",
+                  ulong, "memory" ) MeasureResults;
 
     version( linux )
     {
         import core.sys.posix.signal: SIGKILL, SIGTERM;
+        
+        shared static this()
+        {
+            TERM_SIGNAL = SIGTERM;
+            KILL_SIGNAL = SIGKILL;
+
+            // Check if proc table of status has proper form.
+            ProcTableCell[] tableCells =
+            [   
+                ProcTableCell( "Pid", 4, 0 ),
+                ProcTableCell( "PPid", 5, 0 ),
+                ProcTableCell( "VmHWM", 15, 0 ),
+                ProcTableCell( "kB", 15, 2 )
+            ];
+            ProcTableEntries entries = getProcTableEntries( "/proc/1/status",
+                                                            tableCells );
+            assert( entries.value( "Pid" ).startsWith( "Pid" ) &&
+                    entries.value( "PPid" ).startsWith( "PPid" ) &&
+                    entries.value( "VmHWM" ).startsWith( "VmHWM" ) &&
+                    entries.value( "kB" ).startsWith( "kB" ) );
+
+            // Check if proc table of stat has proper form.
+            entries = getProcTableEntries( "/proc/stat" );
+            // Support for Linux 2.6.0 and above
+            assert( entries.value( "0,0" ) == "cpu" &&
+                    entries.value( "1,0" ) == "cpu0" );
+        }
 
         private Cpu[] cpuTimesPerCore()
         {
             ProcTableEntries entries = getProcTableEntries( "/proc/stat" );
-            // Support for Linux 2.6.0 and above
-            assert( entries.value( "0,0" ) == "cpu" &&
-                    entries.value( "1,0" ) == "cpu0" );
             Cpu[] cpus;
             string line;
             for( int i = 1;
@@ -306,53 +335,6 @@ public:
             return cpus;
         }
 
-        private ulong measureMemory( Pid pid )
-        {
-            ProcTableCell[] tableCells =
-            [   
-                ProcTableCell( "Pid", 4, 0 ),
-                ProcTableCell( "PPid", 5, 0 ),
-                ProcTableCell( "VmHWM", 15, 0 ),
-                ProcTableCell( "kB", 15, 2 )
-            ];
-            ProcTableEntries entries = getProcTableEntries( "/proc/1/status",
-                                                            tableCells );
-            assert( entries.value( "Pid" ).startsWith( "Pid" ) &&
-                    entries.value( "PPid" ).startsWith( "PPid" ) &&
-                    entries.value( "VmHWM" ).startsWith( "VmHWM" ) &&
-                    entries.value( "kB" ).startsWith( "kB" ) );
-            ulong termTimeout = 5 * 60;
-            ulong killTimeout = termTimeout + 30;
-            StopWatch timeoutWatch;
-            timeoutWatch.start();
-            auto child = tryWait( pid );
-            ulong maxMemory;
-            while( !child.terminated )
-            {
-                StopWatch sw;
-                sw.start();
-                maxMemory = max( maxMemoryForProcess( pid ), maxMemory );
-                sw.stop();
-                bool isTermTimeout = timeoutWatch.peek().seconds() >= termTimeout;
-                bool isKillTimeout = timeoutWatch.peek().seconds() >= killTimeout;
-                long sleepTime = 200 - sw.peek().msecs();
-                if( isTermTimeout && !isKillTimeout )
-                {
-                    kill( pid, SIGTERM );
-                }
-                if( isKillTimeout )
-                {
-                    kill( pid, SIGKILL );
-                }
-                if( sleepTime > 0 )
-                {
-                    core.thread.Thread.sleep( dur!( "msecs" )( sleepTime ) );
-                }
-                child = tryWait( pid );
-            }
-            return maxMemory;
-        }
-
         private CpuTimes getCpuTimes()
         {
             import core.sys.posix.unistd;
@@ -366,9 +348,61 @@ public:
             return CpuTimes( utime, stime );
         }
 
-        private int getKillTimeoutSignal()
+        private ulong maxMemoryForProcess( Pid p_pid )
         {
-            return -SIGKILL;
+            ulong memory = 0;
+            auto entries = dirEntries( "/proc", SpanMode.shallow, false );
+            foreach( string name; entries )
+            {
+                immutable pidString = baseName( name );
+                if( name.exists && name.isDir && pidString.isNumeric )
+                {
+                    int pid = to!int( pidString );
+                    string procPath = name ~ "/status";
+                    int ppid = getProcTableEntry!int( procPath, 5, 1 );
+
+                    if( pid == p_pid.processID || ppid == p_pid.processID )
+                    {
+                        memory += getProcTableEntry!ulong( procPath, 15, 1 );
+                    }
+                }
+            }
+            return memory;
+        }
+
+        private int getTermTimeoutStatus()
+        {
+            return -TERM_SIGNAL;
+        }
+
+        private int getKillTimeoutStatus()
+        {
+            return -KILL_SIGNAL;
+        }
+
+        private MeasureResults measure( string[] cmd,
+                              File processIn,
+                              File processOut )
+        {
+            Cpu[] cpu0 = cpuTimesPerCore();
+            CpuTimes cpuTimes0 = getCpuTimes();
+            StopWatch sw;
+            sw.start();
+            Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
+            auto memoryTask = task( &measureMemory, pid );
+            memoryTask.executeInNewThread();
+            int status = wait( pid );
+            sw.stop();
+            CpuTimes cpuTimes1 = getCpuTimes();
+            Cpu[] cpu1 = cpuTimesPerCore();
+            MeasureResults mr;
+            mr.cpuLoad = cpuLoadPerCore( cpu0, cpu1 );
+            mr.elapsedSecs = sw.peek().to!( "seconds", double )();
+            mr.cpuSecs = ( ( cpuTimes1.utime - cpuTimes0.utime ) +
+                           ( cpuTimes1.stime - cpuTimes0.stime ) ) /
+                           1_000_000;
+            mr.memory = memoryTask.yieldForce();
+            return mr;
         }
     }
     else version( Windows )
@@ -377,16 +411,16 @@ public:
         import win32.winnt;
         import win32.winbase;
 
+        shared static this()
+        {
+            TERM_SIGNAL = 1;
+            KILL_SIGNAL = 2;
+        }
 
         private Cpu[] cpuTimesPerCore()
         {
             Cpu[] cpus;
             return cpus;
-        }
-
-        private ulong measureMemory( Pid pid )
-        {
-            return 0;
         }
 
         private double getCpuTimes( HANDLE p_jobHandle )
@@ -402,9 +436,43 @@ public:
             return userTime + kernelTime;
         }
 
-        private int getKillTimeoutSignal()
+        private ulong maxMemoryForProcess( Pid p_pid )
         {
             return 0;
+        }
+
+        private int getTermTimeoutStatus()
+        {
+            return TERM_SIGNAL;
+        }
+
+        private int getKillTimeoutStatus()
+        {
+            return KILL_SIGNAL;
+        }
+
+        private MeasureResults measure( string[] cmd,
+                              File processIn,
+                              File processOut )
+        {
+            MeasureResults mr;
+            Cpu[] cpu0 = cpuTimesPerCore();
+            StopWatch sw;
+            sw.start();
+            Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
+            HANDLE jobHandle = CreateJobObject( NULL, NULL );
+            AssignProcessToJobObject( jobHandle, pid.osHandle() );
+            auto memoryTask = task( &measureMemory, pid );
+            memoryTask.executeInNewThread();
+            int status = wait( pid );
+            sw.stop();
+            mr.cpuSecs = getCpuTimes( jobHandle );
+            CloseHandle( jobHandle );
+            Cpu[] cpu1 = cpuTimesPerCore();
+            mr.cpuLoad = cpuLoadPerCore( cpu0, cpu1 );
+            mr.elapsedSecs = sw.peek().to!( "seconds", double )();
+            mr.memory = memoryTask.yieldForce();
+            return mr;
         }
     }
     else version( OSX )
@@ -416,45 +484,57 @@ public:
         static assert( 0, "Unsupported OS" );
     }
 
-    private string cpuLoadPerCore( Cpu[] cpu0, Cpu[] cpu1 )
+    private int[] cpuLoadPerCore( Cpu[] cpu0, Cpu[] cpu1 )
     {
-        string cpuLoadPerCore;
+        int[] cpuLoadPerCore;
         for( int i = 0; i < cpu0.length; i++ )
         {
             float idleDelta = cpu1[ i ].idle - cpu0[ i ].idle;
             ulong totalDelta = cpu1[ i ].total - cpu0[ i ].total;
             int cpuLoad = roundTo!int( 100 * ( 1.0 - idleDelta / totalDelta ) );
-            cpuLoadPerCore ~= to!string( cpuLoad ) ~ "% ";
+            cpuLoadPerCore ~= cpuLoad;
         }
         return cpuLoadPerCore;
     }
 
-    private ulong maxMemoryForProcess( Pid p_pid )
+    private ulong measureMemory( Pid pid )
     {
-        ulong memory = 0;
-        auto entries = dirEntries( "/proc", SpanMode.shallow, false );
-        foreach( string name; entries )
+        ulong termTimeout = 5 * 60;
+        ulong killTimeout = termTimeout + 30;
+        StopWatch timeoutWatch;
+        timeoutWatch.start();
+        auto child = tryWait( pid );
+        ulong maxMemory;
+        while( !child.terminated )
         {
-            immutable pidString = baseName( name );
-            if( name.exists && name.isDir && pidString.isNumeric )
+            StopWatch sw;
+            sw.start();
+            maxMemory = max( maxMemoryForProcess( pid ), maxMemory );
+            sw.stop();
+            bool isTermTimeout = timeoutWatch.peek().seconds() >= termTimeout;
+            bool isKillTimeout = timeoutWatch.peek().seconds() >= killTimeout;
+            long sleepTime = 200 - sw.peek().msecs();
+            if( isTermTimeout && !isKillTimeout )
             {
-                int pid = to!int( pidString );
-                string procPath = name ~ "/status";
-                int ppid = getProcTableEntry!int( procPath, 5, 1 );
-
-                if( pid == p_pid.processID || ppid == p_pid.processID )
-                {
-                    memory += getProcTableEntry!ulong( procPath, 15, 1 );
-                }
+                kill( pid, TERM_SIGNAL );
             }
+            if( isKillTimeout )
+            {
+                kill( pid, KILL_SIGNAL );
+            }
+            if( sleepTime > 0 )
+            {
+                core.thread.Thread.sleep( dur!( "msecs" )( sleepTime ) );
+            }
+            child = tryWait( pid );
         }
-        return memory;
+        return maxMemory;
     }
 
-    private void measure( string[] cmd,
-                          string depInputFile = "",
-                          string compilerOutputFile = "",
-                          string benchmarkOutputFile = "" )
+    private void benchmark( string[] cmd,
+                            string depInputFile = "",
+                            string compilerOutputFile = "",
+                            string benchmarkOutputFile = "" )
     {
         auto processIn = stdin;
         auto processOut = stdout;
@@ -477,62 +557,30 @@ public:
                 processOut.close();
             }
         }
-        version( linux )
-        {
-            Cpu[] cpu0 = cpuTimesPerCore();
-            CpuTimes cpuTimes0 = getCpuTimes();
-            StopWatch sw;
-            sw.start();
-            Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
-            auto memoryTask = task( &measureMemory, pid );
-            memoryTask.executeInNewThread();
-            int status = wait( pid );
-            sw.stop();
-            CpuTimes cpuTimes1 = getCpuTimes();
-            CpuTimes cpuTimes = CpuTimes( cpuTimes1.utime - cpuTimes0.utime,
-                                          cpuTimes1.stime - cpuTimes0.stime );
-            double cpuSecs = ( ( cpuTimes1.utime - cpuTimes0.utime ) +
-                               ( cpuTimes1.stime - cpuTimes0.stime ) ) /
-                                1_000_000;
-            Cpu[] cpu1 = cpuTimesPerCore();
-        }
-        else version( Windows )
-        {
-            Cpu[] cpu0 = cpuTimesPerCore();
-            StopWatch sw;
-            sw.start();
-            Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
-            HANDLE jobHandle = CreateJobObject( NULL, NULL );
-            AssignProcessToJobObject( jobHandle, pid.osHandle() );
-            auto memoryTask = task( &measureMemory, pid );
-            memoryTask.executeInNewThread();
-            int status = wait( pid );
-            sw.stop();
-            double cpuSecs = getCpuTimes( jobHandle );
-            CloseHandle( jobHandle );
-            Cpu[] cpu1 = cpuTimesPerCore();
-        }
-        if( status == 0 )
+
+        MeasureResults mr = measure( cmd, processIn, processOut );
+
+        if( mr.status == 0 )
         {
             if( !compilerOutputFile.empty && !benchmarkOutputFile.exists )
             {
                 copy( compilerOutputFile, benchmarkOutputFile );
             }
-            writeln( "~ CPU Load: " ~ cpuLoadPerCore( cpu0, cpu1 ) );
+            writeln( "~ CPU Load: " ~ to!string( mr.cpuLoad ) );
             writefln( "Elapsed seconds: %.2f[s]",
-                      sw.peek().to!( "seconds", double )() );
-            writefln( "CPU seconds: %.2f[s]", cpuSecs );
-            writeln( "Memory: " ~ to!string( memoryTask.yieldForce() ) ~ "[kB]\n" );
+                      mr.elapsedSecs );
+            writefln( "CPU seconds: %.2f[s]", mr.cpuSecs );
+            writeln( "Memory: " ~ to!string( mr.memory ) ~ "[kB]\n" );
         }
         else
         {
-            if( status == 143 )
+            if( mr.status == getTermTimeoutStatus() )
             {
-                stderr.writeln( "Spawned process timed out. (got terminated)\n" );
+                stderr.writeln( "Spawned process timed out and got killed. (terminate)\n" );
             }
-            else if( status == getKillTimeoutSignal() )
+            else if( mr.status == getKillTimeoutStatus() )
             {
-                stderr.writeln( "Spawned process timed out. (got killed)\n" );
+                stderr.writeln( "Spawned process timed out and got killed. (kill)\n" );
             }
             else
             {
@@ -564,7 +612,7 @@ public:
                      compiler.id,
                      "]\n",
                      join( cmd, " " ) );
-            measure( cmd );
+            benchmark( cmd );
         }
     }
 
@@ -648,10 +696,10 @@ public:
                         write( " < " ~ depInputFile );
                     }
                     writeln();
-                    measure( runCommand,
-                             depInputFile,
-                             compilerOutputFile,
-                             benchmarkOutputFile );
+                    benchmark( runCommand,
+                               depInputFile,
+                               compilerOutputFile,
+                               benchmarkOutputFile );
                 }
             }
         }
@@ -701,7 +749,9 @@ public:
         compileOrRun( dependentBenchmark, &run );
     }
 private:
-    static string s_workingDir;
+    shared static string s_workingDir;
+    shared static int TERM_SIGNAL;
+    shared static int KILL_SIGNAL;
     string m_id;
     string[] m_files;
     string[] m_arguments;
