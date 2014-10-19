@@ -140,18 +140,18 @@ public:
     struct ProcTableEntries
     {
         public:
-            void appendToValue( string p_id, char p_char )
+            void appendToValue( string id, char character )
             {
-                valuesPerId[ p_id ] ~= p_char;
+                valuesPerId[ id ] ~= character;
             }
 
-            T value( T = string )( string p_id = valuesPerId.keys[ 0 ] )
+            T value( T = string )( string id = valuesPerId.keys[ 0 ] )
             {
                 static if( is( typeof( T ) == string ) )
                 {
-                    return valuesPerId[ p_id ];
+                    return valuesPerId[ id ];
                 }
-                return to!T( valuesPerId[ p_id ] );
+                return to!T( valuesPerId[ id ] );
             }
 
         private:
@@ -184,16 +184,16 @@ public:
 
     private static ProcTableEntries getProcTableEntries(
                                 string procPath,
-                                ProcTableCell[] p_cells )
+                                ProcTableCell[] cells )
     {
         import std.ascii;
         ProcTableEntries entries;
         bool inWhite = false;
         int i = 0;
         int j = 0;
-        multiSort!( "a[1] < b[1]", "a[2] < b[2]" )( p_cells );
-        auto currentCell = p_cells.front;
-        p_cells.popFront;
+        multiSort!( "a[1] < b[1]", "a[2] < b[2]" )( cells );
+        auto currentCell = cells.front;
+        cells.popFront;
         bool allLines = currentCell.lineIdx < 0 ? true : false;
         bool allColumns = currentCell.columnIdx < 0 ? true : false;
         foreach( ubyte[] c; File( procPath, "r" ).byChunk( 1 ) )
@@ -204,10 +204,10 @@ public:
                     ( i >= currentCell.lineIdx &&
                         ( j > currentCell.columnIdx && !allColumns ) ) )
                 {
-                    if( !p_cells.empty )
+                    if( !cells.empty )
                     {
-                        currentCell = p_cells.front;
-                        p_cells.popFront;
+                        currentCell = cells.front;
+                        cells.popFront;
                     }
                     else
                     {
@@ -348,7 +348,7 @@ public:
             return CpuTimes( utime, stime );
         }
 
-        private ulong maxMemoryForProcess( Pid p_pid )
+        private ulong maxMemoryForProcess( Pid pid )
         {
             ulong memory = 0;
             auto entries = dirEntries( "/proc", SpanMode.shallow, false );
@@ -357,11 +357,11 @@ public:
                 immutable pidString = baseName( name );
                 if( name.exists && name.isDir && pidString.isNumeric )
                 {
-                    int pid = to!int( pidString );
+                    int currentPid = to!int( pidString );
                     string procPath = name ~ "/status";
                     int ppid = getProcTableEntry!int( procPath, 5, 1 );
 
-                    if( pid == p_pid.processID || ppid == p_pid.processID )
+                    if( currentPid == pid.processID || ppid == pid.processID )
                     {
                         memory += getProcTableEntry!ulong( procPath, 15, 1 );
                     }
@@ -389,8 +389,8 @@ public:
             StopWatch sw;
             sw.start();
             Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
-            auto memoryTask = task( &measureMemory, pid );
-            memoryTask.executeInNewThread();
+            auto watchTask = task( &watch, pid );
+            watchTask.executeInNewThread();
             int status = wait( pid );
             sw.stop();
             CpuTimes cpuTimes1 = getCpuTimes();
@@ -401,7 +401,7 @@ public:
             mr.cpuSecs = ( ( cpuTimes1.utime - cpuTimes0.utime ) +
                            ( cpuTimes1.stime - cpuTimes0.stime ) ) /
                            1_000_000;
-            mr.memory = memoryTask.yieldForce();
+            mr.memory = watchTask.yieldForce();
             return mr;
         }
     }
@@ -423,10 +423,21 @@ public:
             return cpus;
         }
 
-        private double getCpuTimes( HANDLE p_jobHandle )
+        private long getMemory( HANDLE jobHandle )
+        {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION ExtendedInfo;
+            QueryInformationJobObject( jobHandle,
+                                       JOBOBJECTINFOCLASS.JobObjectExtendedLimitInformation,
+                                       &ExtendedInfo,
+                                       JOBOBJECT_EXTENDED_LIMIT_INFORMATION.sizeof,
+                                       NULL);
+            return ExtendedInfo.PeakJobMemoryUsed / 1024;
+        }
+
+        private double getCpuTimes( HANDLE jobHandle )
         {
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION BasicInfo;
-            QueryInformationJobObject( p_jobHandle,
+            QueryInformationJobObject( jobHandle,
                                        JOBOBJECTINFOCLASS.JobObjectBasicAccountingInformation,
                                        &BasicInfo,
                                        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.sizeof,
@@ -436,7 +447,7 @@ public:
             return userTime + kernelTime;
         }
 
-        private ulong maxMemoryForProcess( Pid p_pid )
+        private ulong maxMemoryForProcess( Pid pid )
         {
             return 0;
         }
@@ -460,18 +471,18 @@ public:
             StopWatch sw;
             sw.start();
             Pid pid = spawnProcess( cmd, processIn, processOut, stderr );
+            auto watchTask = task( &watch, pid );
+            watchTask.executeInNewThread();
             HANDLE jobHandle = CreateJobObject( NULL, NULL );
             AssignProcessToJobObject( jobHandle, pid.osHandle() );
-            auto memoryTask = task( &measureMemory, pid );
-            memoryTask.executeInNewThread();
             int status = wait( pid );
             sw.stop();
             mr.cpuSecs = getCpuTimes( jobHandle );
+            mr.memory = getMemory( jobHandle );
             CloseHandle( jobHandle );
             Cpu[] cpu1 = cpuTimesPerCore();
             mr.cpuLoad = cpuLoadPerCore( cpu0, cpu1 );
             mr.elapsedSecs = sw.peek().to!( "seconds", double )();
-            mr.memory = memoryTask.yieldForce();
             return mr;
         }
     }
@@ -497,7 +508,7 @@ public:
         return cpuLoadPerCore;
     }
 
-    private ulong measureMemory( Pid pid )
+    private ulong watch( Pid pid )
     {
         ulong termTimeout = 5 * 60;
         ulong killTimeout = termTimeout + 30;
