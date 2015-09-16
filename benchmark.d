@@ -140,114 +140,59 @@ public:
     struct ProcTableEntries
     {
         public:
-            void appendToValue( string id, char character )
+            void setValues( string id, string[] values )
             {
-                valuesPerId[ id ] ~= character;
+                valuesPerId[ id ] = values;
             }
 
-            T value( T = string )( string id = valuesPerId.keys[ 0 ] )
+            T value( T = string )( string id = valuesPerId.keys[ 0 ], int columnIdx = 0 )
             {
                 static if( is( typeof( T ) == string ) )
                 {
-                    return valuesPerId[ id ];
+                    return valuesPerId[ id ][ columnIdx ];
                 }
-                return to!T( valuesPerId[ id ] );
+                return to!T( valuesPerId[ id ][ columnIdx ] );
+            }
+
+            string[] values( string id )
+            {
+                return valuesPerId[ id ];
+            }
+
+            bool contains( string id )
+            {
+                return valuesPerId.keys().canFind( id );
             }
 
         private:
-            string[ string ] valuesPerId;
+            string[][ string ] valuesPerId;
     }
 
     alias Tuple!( string, "id",
                   int, "lineIdx",
                   int, "columnIdx" ) ProcTableCell;
 
-    private T getProcTableEntry( T = string )( string procPath,
-                                               int lineIdx,
-                                               int columnIdx )
-    {
-        return getProcTableEntries( procPath,
-                                    [ ProcTableCell( "",
-                                                     lineIdx,
-                                                     columnIdx )
-                                    ] ).value!T( "" );
-    }
-
-    private static ProcTableEntries getProcTableEntries( string procPath )
-    {
-        return getProcTableEntries( procPath,
-                                    [ ProcTableCell( "",
-                                                     -1,
-                                                     -1 )
-                                    ] );
-    }
-
     private static ProcTableEntries getProcTableEntries(
-                                string procPath,
-                                ProcTableCell[] cells )
+                                string procPath )
     {
-        import std.ascii;
         ProcTableEntries entries;
-        bool inWhite = false;
-        int i = 0;
-        int j = 0;
-        multiSort!( "a[1] < b[1]", "a[2] < b[2]" )( cells );
-        auto currentCell = cells.front;
-        cells.popFront;
-        bool allLines = currentCell.lineIdx < 0 ? true : false;
-        bool allColumns = currentCell.columnIdx < 0 ? true : false;
-        foreach( ubyte[] c; File( procPath, "r" ).byChunk( 1 ) )
+        foreach( line; File( procPath, "r" ).byLine() )
         {
-            if( !allLines || !allColumns )
+            auto rowSplit = line.split( ':' );
+            string rowId;
+            string[] values;
+            if( rowSplit.length > 1 )
             {
-                if( ( i > currentCell.lineIdx && !allLines ) ||
-                    ( i >= currentCell.lineIdx &&
-                        ( j > currentCell.columnIdx && !allColumns ) ) )
-                {
-                    if( !cells.empty )
-                    {
-                        currentCell = cells.front;
-                        cells.popFront;
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
+                rowId = to!string( rowSplit[ 0 ] );
+                values = to!( string[] )( rowSplit[ 1 ].strip().split( regex( `\s+` ) ) );
             }
-            if( c == newline )
+            else
             {
-                i++;
-                j = 0;
-                continue;
+                rowSplit = split( line, regex( `\s+` ) );
+                rowId = to!string( rowSplit[ 0 ] );
+                values = to!( string[] )( rowSplit[ 1..$ ] );
             }
-            if( currentCell.lineIdx == i || allLines )
-            {
-                if( c[ 0 ].isWhite() )
-                {
-                    inWhite = true;
-                    continue;
-                }
-                if( inWhite )
-                {
-                    inWhite = false;
-                    j++;
-                }
-                if( currentCell.columnIdx == j || allColumns )
-                {
-                    if( allLines || allColumns )
-                    {
-                        entries.appendToValue( to!string( i ) ~
-                                               "," ~
-                                               to!string( j ),
-                                               c[ 0 ] );
-                    }
-                    else
-                    {
-                        entries.appendToValue( currentCell.id, c[ 0 ] );
-                    }
-                }
-            }
+            entries.setValues( rowId, values );
         }
         return entries; 
     }
@@ -293,43 +238,37 @@ public:
             KILL_SIGNAL = SIGKILL;
 
             // Check if proc table of status has proper form.
-            ProcTableCell[] tableCells =
-            [   
-                ProcTableCell( "Pid", 4, 0 ),
-                ProcTableCell( "PPid", 5, 0 ),
-                ProcTableCell( "VmHWM", 15, 0 ),
-                ProcTableCell( "kB", 15, 2 )
-            ];
-            ProcTableEntries entries = getProcTableEntries( "/proc/1/status",
-                                                            tableCells );
-            assert( entries.value( "Pid" ).startsWith( "Pid" ) &&
-                    entries.value( "PPid" ).startsWith( "PPid" ) &&
-                    entries.value( "VmHWM" ).startsWith( "VmHWM" ) &&
-                    entries.value( "kB" ).startsWith( "kB" ) );
+            ProcTableEntries entries = getProcTableEntries( "/proc/1/status" );
+
+            assert( entries.contains( "Pid" ) &&
+                    entries.contains( "PPid" ) &&
+                    entries.contains( "VmHWM" ) &&
+                    entries.value( "VmHWM", 1 ).startsWith( "kB" ) );
 
             // Check if proc table of stat has proper form.
             entries = getProcTableEntries( "/proc/stat" );
             // Support for Linux 2.6.0 and above
-            assert( entries.value( "0,0" ) == "cpu" &&
-                    entries.value( "1,0" ) == "cpu0" );
+            assert( entries.contains( "cpu" ) &&
+                    entries.contains( "cpu0" ) );
+            assert( entries.values( "cpu" ).length == 10 &&
+                    entries.values( "cpu0" ).length == 10 );
         }
 
         private Cpu[] cpuTimesPerCore()
         {
             ProcTableEntries entries = getProcTableEntries( "/proc/stat" );
             Cpu[] cpus;
-            string line;
-            for( int i = 1;
-                 entries.value( ( line = to!string( i ) ) ~ ",0" ).startsWith( "cpu" );
-                 i++ )
+            string id;
+            int i = 0;
+            while( entries.contains( ( id = "cpu" ~ to!string( i++ ) ) ) )
             {
                 ulong totalPerCPU = 0;
-                foreach( int j; 1 .. 8 )
+                foreach( int j; 0 .. 7 )
                 {
-                    string column = to!string( j );
-                    totalPerCPU += entries.value!ulong( line ~ "," ~ column );
+                    totalPerCPU += entries.value!ulong( id, j );
                 }
-                ulong idle = entries.value!ulong( line ~ ",4" );
+                ulong idle = entries.value!ulong( id, 3 );
+                idle += entries.value!ulong( id, 4 );
                 cpus ~= [ Cpu( idle, totalPerCPU ) ];
             }
             return cpus;
@@ -359,11 +298,11 @@ public:
                 {
                     int currentPid = to!int( pidString );
                     string procPath = name ~ "/status";
-                    int ppid = getProcTableEntry!int( procPath, 5, 1 );
+                    int ppid = getProcTableEntries( procPath ).value!int( "PPid", 0 );
 
                     if( currentPid == pid.processID || ppid == pid.processID )
                     {
-                        memory += getProcTableEntry!ulong( procPath, 15, 1 );
+                        memory += getProcTableEntries( procPath ).value!ulong( "VmHWM", 0 );
                     }
                 }
             }
