@@ -168,10 +168,6 @@ public:
             string[][ string ] valuesPerId;
     }
 
-    alias Tuple!( string, "id",
-                  int, "lineIdx",
-                  int, "columnIdx" ) ProcTableCell;
-
     private static ProcTableEntries getProcTableEntries(
                                 string procPath )
     {
