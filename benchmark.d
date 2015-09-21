@@ -449,7 +449,7 @@ public:
         ulong killTimeout = termTimeout + 30;
         StopWatch timeoutWatch;
         timeoutWatch.start();
-        auto child = tryWait( pid );
+        Tuple!(bool, "terminated", int, "status") child = tryWait( pid );
         ulong maxMemory;
         while( !child.terminated )
         {
